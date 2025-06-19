@@ -1,64 +1,95 @@
+import sys
 import cv2
+import torch
 import numpy as np
 
-import torch, sys, os
-sys.path.insert(0, r"C:\Users\spart\OneDrive\Documentos\Ingenieria en Desarrollo de Software\6to Cuatrimestre\Arquitectura de Computadoras\ObjectDetection\yolov7")  # ajusta la ruta
-model = torch.hub.load(
-    repo_or_dir=r"C:\Users\spart\OneDrive\Documentos\Ingenieria en Desarrollo de Software\6to Cuatrimestre\Arquitectura de Computadoras\ObjectDetection\yolov7", 
-    model="custom", 
-    source="local",
-    path="models/bestYOLOv7.pt",
-    trust_repo=True
+# 1. Registrar safe global para numpy arrays (por si acaso)
+import torch.serialization
+import numpy.core.multiarray
+torch.serialization.add_safe_globals([numpy.core.multiarray._reconstruct, np.ndarray])
+
+# 2. Añadir ruta de yolov7
+YV7_PATH = "/home/pybot/Documentos/ObjectDetection/yolov7"
+sys.path.insert(0, YV7_PATH)
+
+# 3. Importar la clase Model y la NMS helper
+from models.yolo import Model
+from utils.general import non_max_suppression
+
+# 4. Configuración
+CFG_FILE   = "cfg/training/yolov7-tiny.yaml"  # o tu cfg específica
+WEIGHTS    = "models/bestYOLOv7.pt"
+IMG_SIZE   = 320  # salida de cámara
+CONF_THRESH = 0.25
+IOU_THRESH  = 0.45
+SKIP        = 2
+
+# 5. Instanciar modelo
+#    ch=3 canales, nc=len(model.names) pero lo definimos manualmente
+num_classes = 2  # PET, cans-PET
+model = Model(cfg=CFG_FILE, ch=3, nc=num_classes)
+model.load_state_dict(
+    torch.load(WEIGHTS, map_location="cpu")["model"],
+    strict=False
 )
-model.eval()                       # modo inferencia
-model.conf = 0.25                  # umbral de confianza
-model.iou  = 0.45                  # umbral de NMS
+model.eval()
 
-# === 2. INICIALIZAR CÁMARA ===
+# 6. Cámara
 cam = cv2.VideoCapture(0)
-cam.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
-cam.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
+cam.set(cv2.CAP_PROP_FRAME_WIDTH,  IMG_SIZE)
+cam.set(cv2.CAP_PROP_FRAME_HEIGHT, IMG_SIZE)
 
-# === 3. Lógica de skip frames y dibujo ===
 frame_id = 0
-skip     = 2
 annotated = None
 
-while cam.isOpened():
+while True:
     ret, frame = cam.read()
     if not ret:
         break
 
-    # Sólo inferimos 1 de cada 'skip' frames
-    if frame_id % skip == 0:
-        # YOLOv7 espera imágenes RGB
-        img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    if frame_id % SKIP == 0:
+        # Preprocesar: BGR→RGB, HWC→CHW, float, normalizar, añadir batch
+        img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        img = cv2.resize(img, (IMG_SIZE, IMG_SIZE))
+        img = torch.from_numpy(img).permute(2,0,1).float() / 255.0
+        img = img.unsqueeze(0)
 
         # Inferencia
         with torch.no_grad():
-            results = model(img_rgb)
+            pred = model(img)[0]  # [N,6] (x1,y1,x2,y2,conf,cls)
 
-        # results.xyxy[0] es un tensor [N,6]: [x1,y1,x2,y2,conf,cls]
-        detections = results.xyxy[0].cpu().numpy()
+        # NMS
+        pred = non_max_suppression(
+            pred.unsqueeze(0), 
+            CONF_THRESH, 
+            IOU_THRESH
+        )[0]  # retorna lista de detecciones
 
-        # Copia para dibujar
         annotated = frame.copy()
+        if pred is not None and len(pred):
+            # Scale coords de vuelta a resolución original del frame
+            h0, w0 = frame.shape[:2]
+            gain = min(IMG_SIZE / w0, IMG_SIZE / h0)
+            pad = (0, 0)
+            for *box, conf, cls in pred.cpu().numpy():
+                # Deshacer scale
+                x1, y1, x2, y2 = box
+                x1 = int(x1 / IMG_SIZE * w0)
+                x2 = int(x2 / IMG_SIZE * w0)
+                y1 = int(y1 / IMG_SIZE * h0)
+                y2 = int(y2 / IMG_SIZE * h0)
 
-        # Dibujar cada detección
-        for *box, conf, cls in detections:
-            x1, y1, x2, y2 = map(int, box)
-            label = f"{model.names[int(cls)]} {conf:.2f}"
-            cv2.rectangle(annotated, (x1, y1), (x2, y2), (0,255,0), 2)
-            cv2.putText(annotated, label, (x1, y1-10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 2)
+                label = f"{model.names[int(cls)]} {conf:.2f}"
+                cv2.rectangle(annotated, (x1,y1), (x2,y2), (0,255,0), 2)
+                cv2.putText(annotated, label, (x1, y1-10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 2)
 
     frame_id += 1
 
-    # Mostrar el último frame anotado
     if annotated is not None:
-        cv2.imshow("Fast YOLOv7", annotated)
+        cv2.imshow("YOLOv7 Manual Load", annotated)
 
-    if cv2.waitKey(1) & 0xFF == 27:  # ESC para salir
+    if cv2.waitKey(1) & 0xFF == 27:
         break
 
 cam.release()
