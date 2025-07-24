@@ -1,7 +1,7 @@
 import threading, cv2, torch
 from ultralytics import YOLO
 
-model = YOLO("models/YOLOv11.pt")  # o donde tengas tu modelo entrenado
+model = YOLO("models/best2.pt")  # o donde tengas tu modelo entrenado
 model.fuse()  # optimización opcional
 
 frame_lock = threading.Lock()
@@ -9,7 +9,7 @@ latest_frame = None
 
 def capture_thread():
     global latest_frame
-    cap = cv2.VideoCapture(0)
+    cap = cv2.VideoCapture(1)
     cap.set(3,320); cap.set(4,240)
     while True:
         ret, f = cap.read()
@@ -28,6 +28,15 @@ while True:
     # reescala e infiere
     small = cv2.resize(f, (256,256))
     results = model(small)  # batch de 1
+
+    detections = []
+    for box in results[0].boxes:
+        detections.append({
+            "cls": int(box.cls[0]),
+            "conf": float(box.conf[0])
+            })
+        print(f"[Camera] Detecciones: {detections}")    
+
     ann = results[0].plot()
     img = cv2.resize(ann, (320,240))
 
